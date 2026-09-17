@@ -124,7 +124,7 @@ Copies arrive with the names yazi actually created, so a paste that landed as
 
 - yazi 26.0 or newer, for `trash://` and the current DDS payloads
 - a freedesktop compliant trash, the default on Linux
-- bash and coreutils, used by the trash and purgatory helper
+- `mv`, used only when a restore has to cross filesystems
 
 ## Troubleshooting
 

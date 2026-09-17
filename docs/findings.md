@@ -188,3 +188,40 @@ Checking that a pasted copy is younger than the record that describes it always 
 copy carries the source's modification time, not the time of the paste. Compare the pair
 instead. A file that is still a copy of its source has the same size and the same mtime as
 that source, and that is the check worth making before removing it.
+
+## 14. `ya pkg` deploys only the Lua files, the README, the LICENSE and `assets/`
+
+A shell helper next to `main.lua` runs perfectly from a git checkout and does not exist
+for anybody who installed the plugin. From `yazi-cli/src/package/dependency.rs`:
+
+```rust
+let mut files: Vec<String> =
+  ["LICENSE", "README.md", "main.lua"].into_iter().map(Into::into).collect();
+// plus every other *.lua whose stem is kebab-cased, plus assets/ wholesale
+```
+
+So a plugin is its `.lua` files and nothing else. Sibling modules are fine, a `.sh`, a
+`.py` or a data file is not. Testing from the repo cannot see this, which is why
+`tests/installed.sh` deploys that exact list before it drives yazi.
+
+It also means the trash logic has to live in Lua, since `fs.trash.*` reads and manages
+entries but cannot create one, and `remove` only ever acts on the current selection.
+External *commands* are still fine, only shipped *files* are not.
+
+## 15. `fs.read_dir` needs its options table, and lies about `Cha` without `resolve`
+
+Two separate traps in one call.
+
+```lua
+fs.read_dir(url)                      -- raises: bad argument #2, nil to table
+fs.read_dir(url, {})                  -- works, but every Cha is a dummy
+fs.read_dir(url, { resolve = true })  -- works, and the Cha is real
+```
+
+The raise happens inside an async entry, where it kills the entry with no toast, no log
+line and no visible effect. Identical in shape to item 1.
+
+The second is quieter still. With `{}` every entry comes back with `cha.len == 0` and
+`cha.mtime == nil`, so any sort by date or sum of sizes silently produces nothing useful.
+`fs.cha(f.url)` on the same path returns the real values, which is what makes the
+difference easy to miss.

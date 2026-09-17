@@ -82,6 +82,20 @@ COLUMNS=120 LINES=40 timeout 6 script -qec "yazi /tmp" /dev/null 2>&1 \
 
 Silence means it loaded. This is how the keymap and config were validated.
 
+## Test the installed copy, not the checkout
+
+`tests/installed.sh` copies out the files `ya pkg` actually deploys, which is `LICENSE`,
+`README.md`, `main.lua`, any other kebab cased `*.lua` and `assets/`, and then drives yazi
+against that copy. Anything the plugin reaches for outside that list works from the repo
+and is missing for every real user, see findings item 14.
+
+```sh
+tests/installed.sh    # exits non zero and says which round trip broke
+```
+
+Run it before tagging a release, and after any change that adds a file. A plugin that
+passes every fixture test from the checkout can still be broken on install.
+
 ## Driving a bulk rename
 
 Bulk rename is the slowest thing to drive and the easiest to mistime. Select two or more
