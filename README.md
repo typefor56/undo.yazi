@@ -9,18 +9,23 @@ Press `u`. The file comes back.
      Record in a clean terminal at ~110x30. -->
 ![Undo a delete](assets/undo-delete.gif)
 
+## Contents
+
+- [Why](#why)
+- [Install](#install)
+- [What it can undo](#what-it-can-undo)
+- [What it will not do](#what-it-will-not-do)
+- [Optional protection](#optional-protection)
+- [How it works](#how-it-works)
+- [Requirements](#requirements)
+- [Troubleshooting](#troubleshooting)
+- [License](#license)
+
 ## Why
 
-yazi has no undo for file operations. Delete a file and your only recourse is to open the
-trash and find it yourself. Cut a file into the wrong directory and you have to remember
-where it came from.
-
-The `u` key looks like it should already do this, but upstream it is bound only inside
-`[input]`, the text-entry context. There it undoes **typing** in a rename field or a
-filter box, exactly like `u` in a vim buffer. It has never had anything to do with files,
-and `[mgr]`, the file list, has no `u` binding at all.
-
-This plugin gives that key the meaning you expected.
+yazi has no undo for file operations. Upstream, `u` exists only in `[input]`, where it
+undoes typing in a rename field, and `[mgr]` has no `u` at all. This plugin gives the key
+the meaning you expected.
 
 ## Install
 
@@ -28,19 +33,16 @@ This plugin gives that key the meaning you expected.
 ya pkg add typefor56/undo
 ```
 
-Then bind it in your `keymap.toml`:
-
 ```toml
+# keymap.toml
 [[mgr.prepend_keymap]]
 on   = "u"
 run  = "plugin undo"
 desc = "Undo the last file operation"
 ```
 
-That is the whole setup. Nothing else is rebound and every other key keeps the meaning
-yazi gives it. Undoing a copy is included, and it always asks before it removes anything.
-Protecting the permanent delete is opt in, see
-[Optional protection](#optional-protection).
+That is the whole setup. Copy undo is included and always asks first,
+[protecting `D`](#optional-protection) is opt in, and no other key is touched.
 
 ## What it can undo
 
@@ -54,15 +56,14 @@ Protecting the permanent delete is opt in, see
 | Copy and paste | `y` then `p` | Yes, with a prompt | the created copies are trashed |
 | Permanent delete | `D` | **No**, unless protection is on | see below |
 
-`u` is also context aware. Inside `trash://` it restores whatever you have hovered or
-selected, so it works the way you would expect in both places.
+Inside `trash://`, `u` restores what you have hovered or selected instead.
 
 <!-- SCREENSHOT: assets/notification.png
      The toast after undoing a cut, showing the "undo [action: cut]" title
      and the destination path in the body. -->
 ![Notification](assets/notification.png)
 
-Every undo tells you what it reversed, so you are never guessing whether it fired:
+Every undo says what it did:
 
 ```
 undo [action: delete]    3 files restored to ~/Downloads
@@ -73,17 +74,13 @@ cancel [action: copy]    nothing changed
 
 ## What it will not do
 
-It refuses rather than guesses. If something now occupies the path a file would return
-to, or the file changed since the operation, the undo is declined with a warning and
-nothing is touched. A refused undo never destroys data to make room.
-
-**Permanent delete cannot be undone.** `D` runs `remove --permanently`, which unlinks the
-file with no copy kept anywhere. No plugin can recover it afterwards.
+- **It refuses rather than guesses.** An occupied destination or a file that changed since
+  the operation gives a warning and touches nothing.
+- **Permanent delete cannot be undone.** `D` unlinks, and no plugin recovers that.
 
 ## Optional protection
 
-If you want `D` to be recoverable, the plugin can intercept it and move files to a
-private holding area instead of unlinking them:
+`D` can stage files in a private holding area instead of unlinking them:
 
 ```lua
 -- init.lua
@@ -102,14 +99,9 @@ run  = "plugin undo -- purge"
 desc = "Stage a permanent delete, recoverable with u"
 ```
 
-Both halves are needed, which means you can add either one first and nothing changes until
-the other is there. Without the binding, `D` is yazi's own permanent delete. Without
-`purgatory = true`, the binding hands straight back to it.
-
-Think about this one before enabling it. It changes what `D` means. If you press `D`
-expecting the bytes to be gone, staging them somewhere is the opposite of what you asked
-for, and on a machine where that matters it is a step backwards. It is off by default for
-that reason.
+Both halves are required, so either one alone leaves `D` exactly as yazi ships it. Think
+before enabling it: pressing `D` and getting a staged copy is the opposite of what `D`
+means, which is why it is off by default.
 
 <!-- SCREENSHOT: assets/trash-restore.png
      yazi inside trash:// with two entries selected, about to press u. -->
@@ -119,37 +111,33 @@ that reason.
 
 A journal and an inverter, nothing more.
 
-yazi already broadcasts its own file operations over
-[DDS](https://yazi-rs.github.io/docs/dds). The plugin subscribes to `trash`, `move`,
-`rename`, `bulk-rename` and `duplicate`, writes one record per operation to an append only
-log, and on `u` pops the newest record and applies its inverse.
+- yazi broadcasts its own operations over [DDS](https://yazi-rs.github.io/docs/dds), so the
+  plugin subscribes to `trash`, `move`, `rename`, `bulk-rename` and `duplicate`
+- one record per operation goes to `~/.local/state/yazi/undo.log`, last 200 kept, paths
+  percent encoded so a tab or a newline in a filename cannot break a line
+- `u` pops the newest record and applies its inverse
 
-Copies arrive on `duplicate` carrying the names yazi actually created, so a paste that
-landed as `report_1.pdf` is undone by name and never by guess.
-
-The log lives at `~/.local/state/yazi/undo.log` and is capped at the last 200 operations.
-One line per operation, with the paths percent encoded, which is what stops a tab or a
-newline in a filename from breaking it.
+Copies arrive with the names yazi actually created, so a paste that landed as
+`report_1.pdf` is undone by name and never by guess.
 
 ## Requirements
 
-- yazi 26.0 or newer, for the `trash://` virtual filesystem and the current DDS payloads
-- a freedesktop compliant trash, which is the default on Linux
-- bash and coreutils, which the trash and purgatory helper uses
+- yazi 26.0 or newer, for `trash://` and the current DDS payloads
+- a freedesktop compliant trash, the default on Linux
+- bash and coreutils, used by the trash and purgatory helper
 
 ## Troubleshooting
 
-**`g t` hangs on `Loading...`** This is not the plugin. An orphaned `.trashinfo` record,
-one whose file no longer exists, makes yazi's trash listing never finish. Check for a
-mismatch:
+**`g t` hangs on `Loading...`** Not the plugin. An orphaned `.trashinfo`, one whose file is
+gone, makes yazi's trash listing never finish:
 
 ```sh
 ls -1 ~/.local/share/Trash/info | wc -l
 ls -1 ~/.local/share/Trash/files | wc -l
 ```
 
-If those numbers differ, run `plugin undo -- clean-trash` to move the orphaned records
-into `Trash/orphaned-info`, where they stop breaking the listing and can still be read.
+Different numbers mean orphans. Run `plugin undo -- clean-trash` to park them in
+`Trash/orphaned-info`.
 
 ## License
 
