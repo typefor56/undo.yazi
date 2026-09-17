@@ -1,26 +1,40 @@
 #!/usr/bin/env bash
-# Drive a delete and a copy round trip against an INSTALLED copy of the plugin,
-# not against this checkout.
+# Drive real round trips against an INSTALLED copy of the plugin, not against
+# this checkout, on two different filesystems.
 #
-# `ya pkg` deploys a plugin package as LICENSE, README.md, main.lua, any other
-# kebab cased *.lua, and assets/. Nothing else travels, so anything the plugin
-# reaches for outside that set works here and is missing for everybody who
-# installed it. This script deploys exactly that list, which is why it catches
-# that class of bug and a run from the repo does not.
+# Two things only this script can catch:
+#
+#   `ya pkg` deploys a plugin as LICENSE, README.md, main.lua, any other kebab
+#   cased *.lua and assets/. Nothing else travels, so anything the plugin
+#   reaches for outside that set works from the repo and is missing for every
+#   real user, findings item 14.
+#
+#   A file deleted from another filesystem is trashed to that filesystem's own
+#   trash, not to the home one, findings item 16. A fixture that keeps the work
+#   directory and the trash on one filesystem never sees this.
 #
 # Usage: tests/installed.sh        (needs yazi, tmux and a pty)
 
 set -u
 REPO=$(cd -- "$(dirname -- "$0")/.." && pwd)
-FIX=$(mktemp -d)
+FIX=$(mktemp -d)                 # on whatever TMPDIR is, holds the home trash
+XWORK=/dev/shm/undo-installed-$$ # another filesystem, when there is one
 S=undo-installed-$RANDOM-$$
 FAILED=0
 
-cleanup() { tmux -L "$S" kill-server 2>/dev/null; rm -rf "$FIX"; }
+cleanup() {
+	tmux -L "$S" kill-server 2>/dev/null
+	rm -rf "$FIX" "$XWORK"
+	# only what this script put in the shared volume trash
+	rm -f /dev/shm/.Trash-"$(id -u)"/files/xfs.txt /dev/shm/.Trash-"$(id -u)"/info/xfs.txt.trashinfo
+	rmdir /dev/shm/.Trash-"$(id -u)"/files /dev/shm/.Trash-"$(id -u)"/info \
+		/dev/shm/.Trash-"$(id -u)" 2>/dev/null
+}
 trap cleanup EXIT
 
 ok()   { echo "  ok    $1"; }
 fail() { echo "  FAIL  $1"; FAILED=1; }
+skip() { echo "  skip  $1"; }
 
 # --- deploy exactly what `ya pkg` deploys ------------------------------------
 PLUG="$FIX/config/plugins/undo.yazi"
@@ -38,7 +52,6 @@ if [ -e "$PLUG/trash.sh" ] || [ -e "$PLUG/tests" ]; then
 	fail "the deployment copied more than ya pkg would"
 fi
 
-# --- a yazi that can only see that copy --------------------------------------
 cat > "$FIX/config/init.lua" <<'LUA'
 require("undo"):setup {}
 LUA
@@ -48,11 +61,13 @@ on  = "u"
 run = "plugin undo"
 TOML
 
-printf 'precious\n' > "$FIX/work/a.txt"
-tmux -L "$S" new-session -d -x 130 -y 30 \
-	"XDG_DATA_HOME=$FIX/data XDG_STATE_HOME=$FIX/state YAZI_CONFIG_HOME=$FIX/config yazi $FIX/work"
-sleep 4
-
+start() { # $1 = directory to open, on a yazi that can only see the deployed copy
+	tmux -L "$S" kill-server 2>/dev/null
+	sleep 0.5
+	tmux -L "$S" new-session -d -x 130 -y 30 \
+		"XDG_DATA_HOME=$FIX/data XDG_STATE_HOME=$FIX/state YAZI_CONFIG_HOME=$FIX/config yazi $1"
+	sleep 4
+}
 keys() { tmux -L "$S" send-keys "$@"; }
 toast() {
 	local out
@@ -65,6 +80,9 @@ toast() {
 }
 
 # --- delete and undo, which restores out of the trash ------------------------
+printf 'precious\n' > "$FIX/work/a.txt"
+start "$FIX/work"
+
 keys d; sleep 1; keys Enter; sleep 3
 [ -e "$FIX/work/a.txt" ] && fail "delete did not happen, the fixture is wrong"
 [ "$(ls -1 "$FIX/data/Trash/files" | wc -l)" = 1 ] || fail "nothing reached the trash"
@@ -91,6 +109,28 @@ if [ ! -e "$FIX/work/a_1.txt" ] && [ -e "$FIX/work/a.txt" ] &&
 	ok "copy undone into the trash, original kept, toast: $t"
 else
 	fail "copy undo left the wrong state, toast: $t"
+fi
+
+# --- the same delete, from a filesystem that is not the home one -------------
+same_fs() { [ "$(stat -c %d "$1")" = "$(stat -c %d "$2")" ]; }
+if ! mkdir -p "$XWORK" 2>/dev/null; then
+	skip "no /dev/shm, cross filesystem delete not covered"
+elif same_fs "$XWORK" "$FIX/data"; then
+	skip "/dev/shm is the same filesystem as the fixture, nothing to prove"
+else
+	printf 'elsewhere\n' > "$XWORK/xfs.txt"
+	start "$XWORK"
+	keys d; sleep 1; keys Enter; sleep 3
+	[ -e "$XWORK/xfs.txt" ] && fail "delete did not happen on the other filesystem"
+
+	keys u
+	t=$(toast)
+	sleep 2
+	if [ "$(cat "$XWORK/xfs.txt" 2>/dev/null)" = "elsewhere" ]; then
+		ok "delete undone from the volume trash, toast: $t"
+	else
+		fail "delete on another filesystem not undone, toast: $t"
+	fi
 fi
 
 [ "$FAILED" = 0 ] && echo "installed copy works" || echo "installed copy is broken"

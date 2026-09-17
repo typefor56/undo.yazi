@@ -42,6 +42,16 @@ assert(two[2].from == "/from/2" and two[2].to == "/to/2", "pair 2 is crossed")
 -- an odd trailing path is dropped, never paired with nil
 assert(#M.twos { paths = { "/a", "/b", "/orphan" } } == 1, "an unpaired path must be dropped")
 
+-- the walk that finds the trash of the filesystem a path lives on
+local anc = M.ancestors("/tmp/tmp-1/tmp-1.0/d.txt")
+assert(anc[1] == "/tmp/tmp-1/tmp-1.0", "nearest ancestor wrong: " .. anc[1])
+assert(anc[#anc] == "/", "the walk must end at the root, ended at " .. anc[#anc])
+assert(anc[#anc - 1] == "/tmp", "the mount point must be on the way up")
+for i = 2, #anc do
+	assert(#anc[i] < #anc[i - 1], "the walk must go up, not sideways")
+end
+assert(#M.ancestors("/x.txt") == 1 and M.ancestors("/x.txt")[1] == "/", "a root file has one ancestor")
+
 -- the cap keeps the newest records, not the oldest
 local lines = {}
 for i = 1, M.MAX + 5 do

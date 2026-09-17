@@ -225,3 +225,30 @@ The second is quieter still. With `{}` every entry comes back with `cha.len == 0
 `cha.mtime == nil`, so any sort by date or sum of sizes silently produces nothing useful.
 `fs.cha(f.url)` on the same path returns the real values, which is what makes the
 difference easy to miss.
+
+## 16. A file deleted from another filesystem is not in the home trash
+
+The freedesktop spec puts it in that filesystem's own trash, at the top of the mount, and
+yazi follows the spec. Deleting `/tmp/tmp-1/tmp-1.0/d.txt` on a machine where `/tmp` is a
+tmpfs writes `/tmp/.Trash-1000/files/d.txt` and leaves `~/.local/share/Trash` untouched.
+
+```
+$ df --output=fstype /tmp /home   ->   tmpfs, ext4
+$ cat /tmp/.Trash-1000/info/tmp-1.3.trashinfo
+[Trash Info]
+Path=/tmp/tmp-1/tmp-1.3
+```
+
+So restoring means looking in more than one place: the home trash, plus `.Trash-$uid` or
+`.Trash/$uid` in each directory above the file, nearest mount first. `ya.uid()` gives the
+number that names those directories.
+
+Two details in the records themselves. In a volume trash the spec allows `Path=` to be
+relative to the directory holding the trash, so it has to be resolved against that
+directory rather than assumed absolute, even though yazi itself writes it absolute. And
+when this plugin trashes something, it has to write into the volume trash too, otherwise
+the entry is a copy across two filesystems recorded in the wrong place.
+
+The reason this survived a green test suite: every fixture kept the work directory and the
+trash on one filesystem, which is the one arrangement where the bug cannot appear.
+`tests/installed.sh` now puts a work directory on `/dev/shm` for exactly this.

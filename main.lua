@@ -80,7 +80,21 @@ local function basename(p)
 	return p:match("[^/]+$") or p
 end
 
+-- every directory above a path, nearest first, ending at the root. Used to find
+-- the trash of the filesystem the path lives on.
+local function ancestors(path)
+	local list, p = {}, dirname(path)
+	while true do
+		list[#list + 1] = p == "" and "/" or p
+		if p == "" or p == "/" then
+			return list
+		end
+		p = dirname(p)
+	end
+end
+
 M.enc, M.dec, M.encode, M.decode, M.twos, M.cap, M.MAX = enc, dec, encode, decode, twos, cap, MAX
+M.ancestors = ancestors
 
 -- ---------------------------------------------------------------------------
 -- Where things live
@@ -160,6 +174,8 @@ local trash_selection = ya.sync(function()
 	return urls
 end)
 
+local cwd = ya.sync(function() return tostring(cx.active.current.cwd) end)
+
 local selection = ya.sync(function()
 	local urls = {}
 	for _, u in pairs(cx.active.selected) do
@@ -214,26 +230,62 @@ local function move(from, to)
 	return out ~= nil and out.status.success and free(from)
 end
 
--- newest record per original path, skipping the orphans whose file is gone
-local function trash_index()
-	local entries = fs.read_dir(Url(TRASH .. "/info"), { resolve = true })
-	if not entries then
-		return nil
+-- A file deleted from another filesystem does not go to the home trash. It goes
+-- to that filesystem's own trash, at the top of the mount, findings item 16.
+-- So `/tmp/x` on a tmpfs lands in `/tmp/.Trash-1000`, and looking only in
+-- `~/.local/share/Trash` finds nothing at all.
+local UID
+local function uid()
+	if not UID then
+		UID = ya.uid and ya.uid() or (fs.cha(Url(HOME)) or {}).uid
 	end
+	return UID
+end
 
-	local idx = {}
-	for _, f in ipairs(entries) do
-		local base = f.name:match("^(.*)%.trashinfo$")
-		local src = base and TRASH .. "/files/" .. base
-		if src and not free(src) then
-			local orig
-			for line in (read_file(tostring(f.url)) or ""):gmatch("[^\r\n]+") do
-				orig = orig or line:match("^Path=(.*)$")
+-- the home trash, then every volume trash above `path`, nearest mount first.
+-- `top` is the directory a relative `Path=` in that trash resolves against.
+local function trashes_of(path)
+	local found = { { dir = TRASH, top = "/" } }
+	local u = uid()
+	for _, anc in ipairs(u and ancestors(path) or {}) do
+		local base = anc == "/" and "" or anc
+		for _, dir in ipairs { base .. "/.Trash-" .. u, base .. "/.Trash/" .. u } do
+			if fs.cha(Url(dir)) then
+				found[#found + 1] = { dir = dir, top = anc }
 			end
-			orig = orig and dec(orig)
-			local mtime = f.cha.mtime or 0
-			if orig and (not idx[orig] or idx[orig].mtime < mtime) then
-				idx[orig] = { info = tostring(f.url), src = src, mtime = mtime }
+		end
+	end
+	return found
+end
+
+-- where a path should be trashed to: its own volume's trash when there is one,
+-- otherwise the home trash, which costs a copy across the two filesystems
+local function trash_for(path)
+	local list = trashes_of(path)
+	return list[2] or list[1]
+end
+
+-- newest record per original path, skipping the orphans whose file is gone
+local function trash_index(dirs)
+	local idx = {}
+	for _, t in ipairs(dirs) do
+		for _, f in ipairs(fs.read_dir(Url(t.dir .. "/info"), { resolve = true }) or {}) do
+			local base = f.name:match("^(.*)%.trashinfo$")
+			local src = base and t.dir .. "/files/" .. base
+			if src and not free(src) then
+				local orig
+				for line in (read_file(tostring(f.url)) or ""):gmatch("[^\r\n]+") do
+					orig = orig or line:match("^Path=(.*)$")
+				end
+				orig = orig and dec(orig)
+				-- a volume trash may record a path relative to its own mount
+				if orig and orig:sub(1, 1) ~= "/" then
+					orig = (t.top == "/" and "" or t.top) .. "/" .. orig
+				end
+				local mtime = f.cha.mtime or 0
+				if orig and (not idx[orig] or idx[orig].mtime < mtime) then
+					idx[orig] = { info = tostring(f.url), src = src, mtime = mtime }
+				end
 			end
 		end
 	end
@@ -242,11 +294,17 @@ end
 
 -- put these exact paths back where their records say they came from
 local function trash_restore(paths)
-	local idx = trash_index()
-	if not idx then
-		return nil, "no trash at " .. tilde(TRASH)
+	local dirs, seen = {}, {}
+	for _, path in ipairs(paths) do
+		for _, t in ipairs(trashes_of(path)) do
+			if not seen[t.dir] then
+				seen[t.dir] = true
+				dirs[#dirs + 1] = t
+			end
+		end
 	end
 
+	local idx = trash_index(dirs)
 	local plan = {}
 	for _, path in ipairs(paths) do
 		if not idx[path] then
@@ -274,24 +332,25 @@ local function trash_put(paths)
 			return nil, "gone: " .. tilde(path)
 		end
 	end
-	fs.create("dir_all", Url(TRASH .. "/files"))
-	fs.create("dir_all", Url(TRASH .. "/info"))
-
 	local stamp = os.date("%Y-%m-%dT%H:%M:%S")
 	for _, path in ipairs(paths) do
+		local dir = trash_for(path).dir
+		fs.create("dir_all", Url(dir .. "/files"))
+		fs.create("dir_all", Url(dir .. "/info"))
+
 		local name, n = basename(path), 1
-		while not (free(TRASH .. "/files/" .. name) and free(TRASH .. "/info/" .. name .. ".trashinfo")) do
+		while not (free(dir .. "/files/" .. name) and free(dir .. "/info/" .. name .. ".trashinfo")) do
 			name, n = basename(path) .. "." .. n, n + 1
 		end
 
 		-- the record is written first and taken back if the move fails, because a
 		-- record with no file beside it hangs yazi's trash listing forever,
 		-- findings item 6
-		local info = TRASH .. "/info/" .. name .. ".trashinfo"
+		local info = dir .. "/info/" .. name .. ".trashinfo"
 		local body = string.format("[Trash Info]\nPath=%s\nDeletionDate=%s\n", enc(path), stamp)
 		if not fs.write(Url(info), body) then
 			return nil, "cannot write the trash record for " .. tilde(path)
-		elseif not move(path, TRASH .. "/files/" .. name) then
+		elseif not move(path, dir .. "/files/" .. name) then
 			fs.remove("file", Url(info))
 			return nil, "could not move it to the trash: " .. tilde(path)
 		end
@@ -300,19 +359,17 @@ local function trash_put(paths)
 end
 
 -- park the records whose file is gone, findings item 6
-local function trash_orphans()
-	local entries = fs.read_dir(Url(TRASH .. "/info"), { resolve = true })
-	if not entries then
-		return nil, "no trash at " .. tilde(TRASH)
-	end
-
-	local park, n = TRASH .. "/orphaned-info", 0
-	for _, f in ipairs(entries) do
-		local base = f.name:match("^(.*)%.trashinfo$")
-		if base and free(TRASH .. "/files/" .. base) then
-			fs.create("dir_all", Url(park))
-			if move(tostring(f.url), park .. "/" .. f.name) then
-				n = n + 1
+local function trash_orphans(where)
+	local n = 0
+	for _, t in ipairs(trashes_of(where)) do
+		local park = t.dir .. "/orphaned-info"
+		for _, f in ipairs(fs.read_dir(Url(t.dir .. "/info"), { resolve = true }) or {}) do
+			local base = f.name:match("^(.*)%.trashinfo$")
+			if base and free(t.dir .. "/files/" .. base) then
+				fs.create("dir_all", Url(park))
+				if move(tostring(f.url), park .. "/" .. f.name) then
+					n = n + 1
+				end
 			end
 		end
 	end
@@ -539,7 +596,7 @@ end
 -- README troubleshooting: an orphaned .trashinfo hangs the trash listing
 -- forever, findings item 6
 function M.clean_trash()
-	local n, err = trash_orphans()
+	local n, err = trash_orphans(cwd())
 	if not n then
 		return notify("undo [action: clean-trash]", err, "error")
 	end

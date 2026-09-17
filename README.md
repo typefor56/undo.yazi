@@ -116,6 +116,8 @@ A journal and an inverter, nothing more.
 - one record per operation goes to `~/.local/state/yazi/undo.log`, last 200 kept, paths
   percent encoded so a tab or a newline in a filename cannot break a line
 - `u` pops the newest record and applies its inverse
+- a file deleted from another filesystem comes back from that volume's own trash, such as
+  `/tmp/.Trash-1000`, which is where the spec puts it
 
 Copies arrive with the names yazi actually created, so a paste that landed as
 `report_1.pdf` is undone by name and never by guess.
