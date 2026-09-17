@@ -133,8 +133,9 @@ Copies arrive with the names yazi actually created, so a paste that landed as
 
 ## Requirements
 
+- Linux only. It reads the freedesktop trash at `$XDG_DATA_HOME/Trash`, which macOS and
+  Windows do not use.
 - yazi 26.0 or newer, for `trash://` and the current DDS payloads
-- a freedesktop compliant trash, the default on Linux
 - `mv`, used only when a restore has to cross filesystems
 
 ## Troubleshooting
