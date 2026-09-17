@@ -90,8 +90,7 @@ local HOME = os.getenv("HOME") or ""
 local STATE = (os.getenv("XDG_STATE_HOME") or HOME .. "/.local/state") .. "/yazi"
 local LOG = STATE .. "/undo.log"
 local PURGATORY = STATE .. "/undo-purgatory"
-local CONFIG = os.getenv("YAZI_CONFIG_HOME") or (os.getenv("XDG_CONFIG_HOME") or HOME .. "/.config") .. "/yazi"
-local SH = CONFIG .. "/plugins/undo.yazi/trash.sh"
+local TRASH = (os.getenv("XDG_DATA_HOME") or HOME .. "/.local/share") .. "/Trash"
 
 -- ---------------------------------------------------------------------------
 -- The journal on disk. `io` is available in both the sync and the async VM, so
@@ -183,18 +182,184 @@ local function done(action, content) notify("undo [action: " .. action .. "]", c
 local function refuse(action, content) notify("undo [action: " .. action .. "]", content, "warn") end
 local function cancel(action, content) notify("cancel [action: " .. action .. "]", content, "warn") end
 
--- Runs trash.sh. Returns the trimmed stdout, or nil plus the reason it refused.
-local function sh(args)
-	local out, err = Command("bash"):arg(SH):arg(args):stdout(Command.PIPED):stderr(Command.PIPED):output()
-	if not out then
-		return nil, "cannot run trash.sh: " .. tostring(err)
+-- ---------------------------------------------------------------------------
+-- The trash, by hand. Lua can read and delete trash entries through `fs.trash`
+-- but cannot create one, and a plugin package ships only its `.lua` files and
+-- `assets/`, so a helper script is not an option: findings item 14. All of this
+-- runs in the async entry, where `fs` exists.
+-- ---------------------------------------------------------------------------
+
+local function read_file(path)
+	local f = io.open(path, "r")
+	if not f then
+		return nil
 	end
-	local trim = function(s) return (s or ""):gsub("%s+$", "") end
-	if not out.status.success then
-		local why = trim(out.stderr)
-		return nil, why ~= "" and why or "trash.sh failed"
+	local body = f:read("a")
+	f:close()
+	return body
+end
+
+-- nothing at this path, not even a broken symlink
+local function free(path)
+	return fs.cha(Url(path)) == nil
+end
+
+-- rename(2) cannot cross filesystems and a trash or a purgatory can easily be
+-- on another one, so `mv` is the fallback for exactly that case
+local function move(from, to)
+	if fs.rename(Url(from), Url(to)) then
+		return true
 	end
-	return trim(out.stdout)
+	local out = Command("mv"):arg({ "-n", "--", from, to }):stderr(Command.PIPED):output()
+	return out ~= nil and out.status.success and free(from)
+end
+
+-- newest record per original path, skipping the orphans whose file is gone
+local function trash_index()
+	local entries = fs.read_dir(Url(TRASH .. "/info"), { resolve = true })
+	if not entries then
+		return nil
+	end
+
+	local idx = {}
+	for _, f in ipairs(entries) do
+		local base = f.name:match("^(.*)%.trashinfo$")
+		local src = base and TRASH .. "/files/" .. base
+		if src and not free(src) then
+			local orig
+			for line in (read_file(tostring(f.url)) or ""):gmatch("[^\r\n]+") do
+				orig = orig or line:match("^Path=(.*)$")
+			end
+			orig = orig and dec(orig)
+			local mtime = f.cha.mtime or 0
+			if orig and (not idx[orig] or idx[orig].mtime < mtime) then
+				idx[orig] = { info = tostring(f.url), src = src, mtime = mtime }
+			end
+		end
+	end
+	return idx
+end
+
+-- put these exact paths back where their records say they came from
+local function trash_restore(paths)
+	local idx = trash_index()
+	if not idx then
+		return nil, "no trash at " .. tilde(TRASH)
+	end
+
+	local plan = {}
+	for _, path in ipairs(paths) do
+		if not idx[path] then
+			return nil, "not in the trash: " .. tilde(path)
+		elseif not free(path) then
+			return nil, "occupied: " .. tilde(path)
+		end
+		plan[#plan + 1] = { e = idx[path], to = path }
+	end
+
+	for _, step in ipairs(plan) do
+		fs.create("dir_all", Url(dirname(step.to)))
+		if not move(step.e.src, step.to) then
+			return nil, "could not move it back to " .. tilde(step.to)
+		end
+		fs.remove("file", Url(step.e.info))
+	end
+	return #plan
+end
+
+-- send paths to the trash, which is how undoing a copy stays undoable
+local function trash_put(paths)
+	for _, path in ipairs(paths) do
+		if free(path) then
+			return nil, "gone: " .. tilde(path)
+		end
+	end
+	fs.create("dir_all", Url(TRASH .. "/files"))
+	fs.create("dir_all", Url(TRASH .. "/info"))
+
+	local stamp = os.date("%Y-%m-%dT%H:%M:%S")
+	for _, path in ipairs(paths) do
+		local name, n = basename(path), 1
+		while not (free(TRASH .. "/files/" .. name) and free(TRASH .. "/info/" .. name .. ".trashinfo")) do
+			name, n = basename(path) .. "." .. n, n + 1
+		end
+
+		-- the record is written first and taken back if the move fails, because a
+		-- record with no file beside it hangs yazi's trash listing forever,
+		-- findings item 6
+		local info = TRASH .. "/info/" .. name .. ".trashinfo"
+		local body = string.format("[Trash Info]\nPath=%s\nDeletionDate=%s\n", enc(path), stamp)
+		if not fs.write(Url(info), body) then
+			return nil, "cannot write the trash record for " .. tilde(path)
+		elseif not move(path, TRASH .. "/files/" .. name) then
+			fs.remove("file", Url(info))
+			return nil, "could not move it to the trash: " .. tilde(path)
+		end
+	end
+	return #paths
+end
+
+-- park the records whose file is gone, findings item 6
+local function trash_orphans()
+	local entries = fs.read_dir(Url(TRASH .. "/info"), { resolve = true })
+	if not entries then
+		return nil, "no trash at " .. tilde(TRASH)
+	end
+
+	local park, n = TRASH .. "/orphaned-info", 0
+	for _, f in ipairs(entries) do
+		local base = f.name:match("^(.*)%.trashinfo$")
+		if base and free(TRASH .. "/files/" .. base) then
+			fs.create("dir_all", Url(park))
+			if move(tostring(f.url), park .. "/" .. f.name) then
+				n = n + 1
+			end
+		end
+	end
+	return n
+end
+
+-- ---------------------------------------------------------------------------
+-- The purgatory
+-- ---------------------------------------------------------------------------
+
+local function size_of(url, cha)
+	cha = cha or fs.cha(url)
+	if not cha then
+		return 0
+	elseif not cha.is_dir then
+		return cha.len or 0
+	end
+	local total = 0
+	for _, f in ipairs(fs.read_dir(url, { resolve = true }) or {}) do
+		total = total + size_of(f.url, f.cha)
+	end
+	return total
+end
+
+-- oldest first, by age then by size, both limits off when not positive
+local function prune(days, gb)
+	local entries = fs.read_dir(Url(PURGATORY), { resolve = true })
+	if not entries then
+		return
+	end
+
+	local held, total = {}, 0
+	for _, f in ipairs(entries) do
+		local size = size_of(f.url, f.cha)
+		held[#held + 1] = { url = f.url, mtime = f.cha.mtime or 0, is_dir = f.cha.is_dir, size = size }
+		total = total + size
+	end
+	table.sort(held, function(a, b) return a.mtime < b.mtime end)
+
+	local cutoff = days > 0 and os.time() - days * 86400 or -1
+	local max = gb > 0 and gb * 1024 * 1024 * 1024 or math.huge
+	for _, e in ipairs(held) do
+		if e.mtime < cutoff or total > max then
+			fs.remove(e.is_dir and "dir_all" or "file", e.url)
+			total = total - e.size
+		end
+	end
 end
 
 -- ---------------------------------------------------------------------------
@@ -203,28 +368,28 @@ end
 
 -- delete: the paths are where the files were when they were trashed
 local function undo_delete(rec)
-	local args = { "restore" }
-	for _, p in ipairs(rec.paths) do
-		args[#args + 1] = p
-	end
-	local n, err = sh(args)
+	local n, err = trash_restore(rec.paths)
 	if not n then
 		return false, err
 	end
-	return true, string.format("%s restored to %s", n == "1" and "1 file" or n .. " files", tilde(dirname(rec.paths[1])))
+	return true, string.format("%s restored to %s", n == 1 and "1 file" or n .. " files", tilde(dirname(rec.paths[1])))
 end
 
 -- cut, rename, bulk and purge all invert the same way: move `to` back to `from`
 local function undo_move(rec)
-	local args = { "move" }
 	local pairs_ = twos(rec)
 	for _, p in ipairs(pairs_) do
-		args[#args + 1] = p.to
-		args[#args + 1] = p.from
+		if free(p.to) then
+			return false, "gone: " .. tilde(p.to)
+		elseif not free(p.from) then
+			return false, "occupied: " .. tilde(p.from)
+		end
 	end
-	local n, err = sh(args)
-	if not n then
-		return false, err
+	for _, p in ipairs(pairs_) do
+		fs.create("dir_all", Url(dirname(p.from)))
+		if not move(p.to, p.from) then
+			return false, "could not move it back to " .. tilde(p.from)
+		end
 	end
 	if #pairs_ == 1 then
 		return true, "moved back to " .. tilde(pairs_[1].from)
@@ -265,11 +430,11 @@ local function undo_copy(rec)
 		return nil, "nothing changed"
 	end
 
-	local args = { "trash" }
+	local targets = {}
 	for _, p in ipairs(pairs_) do
-		args[#args + 1] = p.to
+		targets[#targets + 1] = p.to
 	end
-	local n, err = sh(args)
+	local n, err = trash_put(targets)
 	if not n then
 		return false, err
 	end
@@ -350,30 +515,31 @@ function M.purge(args)
 		return refuse("purge", "Nothing selected")
 	end
 
-	local stamp = os.time()
-	local paths, move = {}, { "move" }
+	fs.create("dir_all", Url(PURGATORY))
+	local stamp, paths = os.time(), {}
 	for i, p in ipairs(sel) do
 		local staged = string.format("%s/%d-%d-%s", PURGATORY, stamp, i, basename(p))
+		if not move(p, staged) then
+			return notify("undo [action: purge]", "could not stage " .. tilde(p), "error")
+		end
 		paths[#paths + 1] = p
 		paths[#paths + 1] = staged
-		move[#move + 1] = p
-		move[#move + 1] = staged
 	end
 
-	local n, err = sh(move)
-	if not n then
-		return notify("undo [action: purge]", err, "error")
-	end
 	append("purge", paths)
-	sh { "prune", PURGATORY, tostring(opts.purgatory_max_days or 30), tostring(opts.purgatory_max_gb or 1) }
-	notify("staged [action: purge]", string.format("%s item(s) held in the purgatory, `u` brings them back", n), "info")
+	prune(opts.purgatory_max_days or 30, opts.purgatory_max_gb or 1)
+	notify(
+		"staged [action: purge]",
+		string.format("%d item(s) held in the purgatory, `u` brings them back", #sel),
+		"info"
+	)
 	ya.emit("refresh", {})
 end
 
 -- README troubleshooting: an orphaned .trashinfo hangs the trash listing
 -- forever, findings item 6
 function M.clean_trash()
-	local n, err = sh { "orphans" }
+	local n, err = trash_orphans()
 	if not n then
 		return notify("undo [action: clean-trash]", err, "error")
 	end
