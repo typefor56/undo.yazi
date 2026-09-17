@@ -1,0 +1,3 @@
+# the journal is per-machine runtime state, never committed
+*.jsonl
+undo-purgatory/

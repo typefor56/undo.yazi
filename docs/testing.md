@@ -1,0 +1,94 @@
+# Testing a yazi plugin without a terminal
+
+yazi is a full screen TUI, so it needs a pty. `yazi --help` and friends exit before the
+config is ever parsed, which means they prove nothing. Drive a real instance through tmux
+and read the screen back.
+
+## Three rules
+
+**Always use `tmux -L <unique-socket>`.** A plain `tmux kill-server` destroys the user's
+own running session. That happened while building the prototype. Every command below
+carries `-L`.
+
+**Always isolate `XDG_DATA_HOME`.** The trash lives under it, so pointing it at a fixture
+directory means a bug cannot reach the real trash. This plugin moves and deletes files,
+so this is not optional.
+
+**Isolate `YAZI_CONFIG_HOME` too when testing config**, and leave it alone when you want
+to test against the user's real setup.
+
+## The harness
+
+```sh
+#!/usr/bin/env bash
+# build a fixture: an isolated trash plus a working directory
+FIX=$(mktemp -d)
+mkdir -p "$FIX/Trash/files" "$FIX/Trash/info" "$FIX/work"
+echo "REAL WORK" > "$FIX/work/important.txt"
+
+S=test-$RANDOM                      # unique socket, never the default
+tmux -L "$S" new-session -d -x 130 -y 30 \
+  "XDG_DATA_HOME=$FIX yazi $FIX/work"
+sleep 4                             # yazi needs a moment to draw
+
+tmux -L "$S" send-keys d ; sleep 2  # delete
+tmux -L "$S" send-keys Enter ; sleep 3   # confirm the prompt
+echo "after d: work=$(ls "$FIX/work" | wc -l) trash=$(ls "$FIX/Trash/files" | wc -l)"
+
+tmux -L "$S" send-keys u ; sleep 4  # undo
+echo "after u: work=$(ls "$FIX/work" | wc -l) trash=$(ls "$FIX/Trash/files" | wc -l)"
+
+tmux -L "$S" capture-pane -p | grep -aiE "undo|cancel|error"
+tmux -L "$S" kill-server
+rm -rf "$FIX"
+```
+
+A passing delete and undo round trip prints `after d: work=0 trash=1` then
+`after u: work=1 trash=0`.
+
+## Reading the screen
+
+`capture-pane -p` returns the rendered text. Pipe through `strings` when you only want
+readable content, and `cut -c` to slice a column range when a panel is what you care
+about:
+
+```sh
+tmux -L "$S" capture-pane -p | sed -n '/Spot/,/╰/p' | cut -c20-105
+```
+
+## Catching a notification
+
+Toasts expire. A 4 second timeout is gone by the time a `sleep 5` finishes, so poll
+instead of guessing:
+
+```sh
+tmux -L "$S" send-keys u
+for d in 0.3 0.8 1.3 2.0; do
+  sleep "$d"
+  out=$(tmux -L "$S" capture-pane -p | grep -aiE "undo \[action|cancel \[action")
+  [ -n "$out" ] && { echo "$out"; break; }
+done
+```
+
+## Checking that the config parses at all
+
+For a pure "does it load" check, `script` is lighter than tmux because it only needs to
+allocate a pty:
+
+```sh
+COLUMNS=120 LINES=40 timeout 6 script -qec "yazi /tmp" /dev/null 2>&1 \
+  | strings | grep -aiE "parse error|caused|unknown|failed"
+```
+
+Silence means it loaded. This is how the keymap and config were validated.
+
+## What this harness cannot test
+
+`tmux send-keys C-i` sends byte `0x09`, which is the Tab character. So `<C-i>` and `<Tab>`
+are indistinguishable here no matter what you do. Whether a real terminal can tell them
+apart depends on its keyboard protocol at runtime, Kitty protocol capable terminals can,
+older ones cannot. Any binding that relies on that distinction has to be verified by hand
+in the actual terminal.
+
+The same caution applies to other control characters that collide with ASCII names, such
+as `<C-m>` and `<Enter>`, or `<C-[>` and `<Esc>`.
