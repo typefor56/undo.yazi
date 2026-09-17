@@ -37,8 +37,10 @@ run  = "plugin undo"
 desc = "Undo the last file operation"
 ```
 
-That is the whole setup for the reversible cases. Copy-undo and permanent-delete
-protection are opt in, see [Optional protection](#optional-protection).
+That is the whole setup. Nothing else is rebound and every other key keeps the meaning
+yazi gives it. Undoing a copy is included, and it always asks before it removes anything.
+Protecting the permanent delete is opt in, see
+[Optional protection](#optional-protection).
 
 ## What it can undo
 
@@ -65,7 +67,7 @@ Every undo tells you what it reversed, so you are never guessing whether it fire
 ```
 undo [action: delete]    3 files restored to ~/Downloads
 undo [action: cut]       moved back to ~/Documents/reports
-undo [action: copy]      2 copies removed
+undo [action: copy]      2 copies moved to the trash
 cancel [action: copy]    nothing changed
 ```
 
@@ -86,12 +88,23 @@ private holding area instead of unlinking them:
 ```lua
 -- init.lua
 require("undo"):setup {
-  copy_undo = true,   -- record pastes so copies can be undone
-  purgatory = true,   -- D stages files instead of unlinking them
+  purgatory = true,        -- D stages files instead of unlinking them
   purgatory_max_gb = 1,
   purgatory_max_days = 30,
 }
 ```
+
+```toml
+# keymap.toml
+[[mgr.prepend_keymap]]
+on   = "D"
+run  = "plugin undo -- purge"
+desc = "Stage a permanent delete, recoverable with u"
+```
+
+Both halves are needed, which means you can add either one first and nothing changes until
+the other is there. Without the binding, `D` is yazi's own permanent delete. Without
+`purgatory = true`, the binding hands straight back to it.
 
 Think about this one before enabling it. It changes what `D` means. If you press `D`
 expecting the bytes to be gone, staging them somewhere is the opposite of what you asked
@@ -108,17 +121,21 @@ A journal and an inverter, nothing more.
 
 yazi already broadcasts its own file operations over
 [DDS](https://yazi-rs.github.io/docs/dds). The plugin subscribes to `trash`, `move`,
-`rename` and `bulk`, writes one record per operation to an append only log, and on `u`
-pops the newest record and applies its inverse. Copy is the one case yazi does not
-broadcast, so that path wraps the paste command instead.
+`rename`, `bulk-rename` and `duplicate`, writes one record per operation to an append only
+log, and on `u` pops the newest record and applies its inverse.
 
-The log lives at `~/.local/state/yazi/undo.jsonl` and is capped at the last 200
-operations.
+Copies arrive on `duplicate` carrying the names yazi actually created, so a paste that
+landed as `report_1.pdf` is undone by name and never by guess.
+
+The log lives at `~/.local/state/yazi/undo.log` and is capped at the last 200 operations.
+One line per operation, with the paths percent encoded, which is what stops a tab or a
+newline in a filename from breaking it.
 
 ## Requirements
 
 - yazi 26.0 or newer, for the `trash://` virtual filesystem and the current DDS payloads
 - a freedesktop compliant trash, which is the default on Linux
+- bash and coreutils, which the trash and purgatory helper uses
 
 ## Troubleshooting
 
@@ -131,9 +148,9 @@ ls -1 ~/.local/share/Trash/info | wc -l
 ls -1 ~/.local/share/Trash/files | wc -l
 ```
 
-If those numbers differ, run `plugin undo clean-trash` to move the orphaned records
-aside.
+If those numbers differ, run `plugin undo -- clean-trash` to move the orphaned records
+into `Trash/orphaned-info`, where they stop breaking the listing and can still be read.
 
 ## License
 
-MIT
+MIT, see [LICENSE](LICENSE).
