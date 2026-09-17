@@ -99,14 +99,14 @@ to.
 | `trash` | `{ urls = { Url, ... } }` |
 | `delete` | `{ urls = { Url, ... } }` (permanent, nothing to invert) |
 | `move` | `{ items = { { from = Url, to = Url }, ... } }` |
+| `duplicate` | `{ items = { { from = Url, to = Url }, ... } }` (a copying paste) |
 | `rename` | `{ tab = 0, from = Url, to = Url }` |
-| `bulk` | `{ changes = { ["/from"] = "/to", ... } }` |
+| `bulk-rename` | a table of `from` to `to`, read with `pairs(body)` |
 | `yank` | `{ cut = false, urls = { ... } }` (clipboard state, not an applied operation) |
 
-There is **no copy event**. A paste that copies creates files and broadcasts nothing,
-which is why copy has to be handled by wrapping the paste command.
-
-`move` covers both cut and paste and plain moves, so one handler serves both.
+`move` covers cut and paste and plain moves, so one handler serves both. Items 11 and 12
+below are corrections to this table that were found by watching a real instance rather
+than by reading, and each one was a silent failure until then.
 
 ## 9. Command and placeholder syntax changed in 26
 
@@ -143,3 +143,48 @@ both:
 ```
 
 Order matters, first match wins, so a catch all belongs last.
+
+## 11. The bulk rename event is called `bulk-rename`, not `bulk`
+
+Subscribing to `bulk` is accepted without complaint and never fires. The publisher is
+`Pubsub::pub_after_bulk_rename`, and the kind it publishes is the hyphenated one.
+
+```lua
+ps.sub("bulk", function(body) end)          -- never called
+ps.sub("bulk-rename", function(body) end)   -- called, once per bulk rename
+```
+
+The body is a plain map of old path to new path, so `for from, to in pairs(body)` is all
+it takes. The `{ changes = ... }` wrapper in the old version of item 8 does not exist.
+
+A subscription to a kind nothing publishes is the worst shape of silent failure, because
+every other subscription in the same `setup()` keeps working and the plugin looks alive.
+
+## 12. A copying paste does broadcast, on `duplicate`
+
+The previous version of this file said there was no copy event and that copy had to be
+handled by wrapping the paste command. That is wrong. `yazi-scheduler/src/hook/hook.rs`
+pushes `duplicate` when a copy task finishes and `move` when a move task finishes:
+
+```rust
+pub(crate) async fn copy(&self, task: HookInOutCopy) {          // -> duplicate
+pub(crate) async fn r#move(&self, task: HookInOutMove) {        // -> move
+```
+
+So `p` never has to be rebound. Two things follow.
+
+The payload carries the name yazi really created, which matters because a paste renames
+around a collision: `a.txt` becomes `a_1.txt`, `c.tar.gz` becomes `c.tar_1.gz`, and a
+directory `d` becomes `d_1`. Predicting those names from the yank list is guesswork that
+the event makes unnecessary.
+
+A cross filesystem cut stays a single move task, which falls back to copying internally
+without publishing `duplicate`, so one cut produces exactly one `move` and never a stray
+copy record.
+
+## 13. A copy keeps the source's mtime, so freshness proves nothing
+
+Checking that a pasted copy is younger than the record that describes it always fails: the
+copy carries the source's modification time, not the time of the paste. Compare the pair
+instead. A file that is still a copy of its source has the same size and the same mtime as
+that source, and that is the check worth making before removing it.

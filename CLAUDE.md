@@ -30,9 +30,10 @@ implements a correct freedesktop restore, including percent decoding, and it is 
 1. **Delete to trash** and **cut / move**. Both fully reversible, both driven by DDS
    events. Ship these first and make them solid.
 2. **Rename** and **bulk rename**. Cheap, same mechanism, from and to are in the payload.
-3. **Copy**. Needs the paste command wrapped, because yazi broadcasts nothing for it.
-   Undoing a copy deletes files, so it must confirm with `ya.confirm` and must verify each
-   target still matches what the paste created before removing anything.
+3. **Copy**. yazi does broadcast it, on `duplicate`, so nothing needs wrapping, see
+   findings item 12. Undoing a copy deletes files, so it must confirm with `ya.confirm`
+   and must verify each target still matches what the paste created before removing
+   anything.
 4. **Purgatory for `D`**. Opt in, default off. See the README section, and keep that
    framing: it changes what `D` means, and the user must choose it deliberately.
 

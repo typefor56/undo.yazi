@@ -82,6 +82,47 @@ COLUMNS=120 LINES=40 timeout 6 script -qec "yazi /tmp" /dev/null 2>&1 \
 
 Silence means it loaded. This is how the keymap and config were validated.
 
+## Driving a bulk rename
+
+Bulk rename is the slowest thing to drive and the easiest to mistime. Select two or more
+files, press `r`, and yazi writes the names into a temp file and hands it to `$EDITOR`
+with the terminal blocked. Three things to know:
+
+- `$EDITOR` has to be passed into the tmux command line. A plain `export` before
+  `new-session` is not enough to rely on.
+- The editor takes about six seconds to be spawned and reaped here. Poll for the file the
+  fake editor writes rather than sleeping a fixed amount.
+- Afterwards yazi asks `Continue to rename? (y/N):`, and that prompt is an input, so it
+  needs `y` and then `Enter`. A lone `y` leaves the prompt open and every later keystroke,
+  including the `u` under test, is swallowed by it.
+
+```sh
+cat > "$FIX/ed.sh" <<'ED'
+#!/usr/bin/env bash
+sed -i 's/^/z_/' "$1"
+touch /tmp/editor-ran
+ED
+chmod +x "$FIX/ed.sh"
+
+tmux -L "$S" send-keys Space ; sleep 1 ; tmux -L "$S" send-keys Space ; sleep 1
+tmux -L "$S" send-keys r
+for i in $(seq 1 15); do sleep 1; [ -e /tmp/editor-ran ] && break; done
+for i in $(seq 1 12); do
+  sleep 0.5
+  tmux -L "$S" capture-pane -p | grep -qa "Continue to rename" && break
+done
+tmux -L "$S" send-keys y ; sleep 0.5 ; tmux -L "$S" send-keys Enter
+```
+
+The same rule applies to any dialog. If a keystroke seems to do nothing, capture the pane
+before concluding the code is broken, because an open prompt eats keys silently.
+
+## Isolate the state directory too
+
+`XDG_DATA_HOME` covers the trash, and `XDG_STATE_HOME` covers the journal and the
+purgatory. A test that isolates only the first one writes its records into the real
+`~/.local/state/yazi`, which is how a test run ends up undoing something from yesterday.
+
 ## What this harness cannot test
 
 `tmux send-keys C-i` sends byte `0x09`, which is the Tab character. So `<C-i>` and `<Tab>`
