@@ -15,7 +15,9 @@ build:
 - an adapter layer that wraps `ps.sub` in your own event type
 - a config system for values that never change
 - an undo *stack* with branching, redo trees, or history navigation. One linear log,
-  newest first, is the feature
+  newest first, is the feature. `<C-r>` was added later on request and stays inside that
+  rule: one second log holding what was undone, cleared by the next real operation, no
+  branch and no tree
 
 The target is a few hundred lines of Lua across a handful of files. If you find yourself
 at a thousand, something went wrong upstream of the code.

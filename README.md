@@ -2,7 +2,7 @@
 
 One key to undo the last file operation in [yazi](https://github.com/sxyazi/yazi).
 
-Press `u`. The file comes back.
+Press `u`. The file comes back. Press `<C-r>` to change your mind again.
 
 <!-- SCREENSHOT: assets/undo-delete.gif
      A short loop: hover a file, press d, the file disappears, press u, it returns.
@@ -39,6 +39,11 @@ ya pkg add typefor56/undo
 on   = "u"
 run  = "plugin undo"
 desc = "Undo the last file operation"
+
+[[mgr.prepend_keymap]]
+on   = "<C-r>"
+run  = "plugin undo -- redo"
+desc = "Redo the last undone operation"
 ```
 
 That is the whole setup. Copy undo is included and always asks first,
@@ -56,7 +61,9 @@ That is the whole setup. Copy undo is included and always asks first,
 | Copy and paste | `y` then `p` | Yes, with a prompt | the created copies are trashed |
 | Permanent delete | `D` | **No**, unless protection is on | see below |
 
-Inside `trash://`, `u` restores what you have hovered or selected instead.
+`<C-r>` replays what `u` just undid, as many steps back as you undid, and any new file
+operation drops that future the way an editor does. Inside `trash://`, `u` restores what
+you have hovered or selected instead.
 
 <!-- SCREENSHOT: assets/notification.png
      The toast after undoing a cut, showing the "undo [action: cut]" title
@@ -69,6 +76,7 @@ Every undo says what it did:
 undo [action: delete]    3 files restored to ~/Downloads
 undo [action: cut]       moved back to ~/Documents/reports
 undo [action: copy]      2 copies moved to the trash
+redo [action: delete]    3 files back in the trash
 cancel [action: copy]    nothing changed
 ```
 
@@ -115,7 +123,8 @@ A journal and an inverter, nothing more.
   plugin subscribes to `trash`, `move`, `rename`, `bulk-rename` and `duplicate`
 - one record per operation goes to `~/.local/state/yazi/undo.log`, last 200 kept, paths
   percent encoded so a tab or a newline in a filename cannot break a line
-- `u` pops the newest record and applies its inverse
+- `u` pops the newest record and applies its inverse, then parks it in
+  `undo-redo.log`, which is where `<C-r>` reads it back from and a new operation clears
 - a file deleted from another filesystem comes back from that volume's own trash, such as
   `/tmp/.Trash-1000`, which is where the spec puts it
 

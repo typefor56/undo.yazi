@@ -59,6 +59,10 @@ cat > "$FIX/config/keymap.toml" <<'TOML'
 [[mgr.prepend_keymap]]
 on  = "u"
 run = "plugin undo"
+
+[[mgr.prepend_keymap]]
+on  = "<C-r>"
+run = "plugin undo -- redo"
 TOML
 
 start() { # $1 = directory to open, on a yazi that can only see the deployed copy
@@ -69,11 +73,11 @@ start() { # $1 = directory to open, on a yazi that can only see the deployed cop
 	sleep 4
 }
 keys() { tmux -L "$S" send-keys "$@"; }
-toast() {
-	local out
+toast() { # $1 = which verb to wait for, default any
+	local out want=${1:-"(undo|redo|cancel)"}
 	for d in 0.3 0.6 1.0 1.5 2.0 2.5; do
 		sleep "$d"
-		out=$(tmux -L "$S" capture-pane -p | grep -aoE "(undo|cancel) \[action: [a-z-]+\]")
+		out=$(tmux -L "$S" capture-pane -p | grep -aoE "$want \[action: [a-z-]+\]" | tail -1)
 		[ -n "$out" ] && { echo "$out"; return; }
 	done
 	echo "(no toast)"
@@ -94,6 +98,18 @@ if [ "$(cat "$FIX/work/a.txt" 2>/dev/null)" = "precious" ]; then
 	ok "delete undone by the installed copy, toast: $t"
 else
 	fail "delete not undone, toast: $t"
+fi
+
+# --- redo, which puts it back in the trash, then undo again ------------------
+keys C-r
+t=$(toast redo)
+sleep 2
+[ -e "$FIX/work/a.txt" ] && fail "redo did not put the file back in the trash, toast: $t"
+keys u; sleep 3
+if [ "$(cat "$FIX/work/a.txt" 2>/dev/null)" = "precious" ]; then
+	ok "redo and undo again, toast: $t"
+else
+	fail "undo after redo left nothing behind, toast: $t"
 fi
 
 # --- copy and undo, which writes a trash record ------------------------------

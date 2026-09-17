@@ -2,8 +2,8 @@
 --- undo.yazi: one key to undo the last file operation.
 ---
 --- A journal and an inverter, nothing more. yazi broadcasts its own operations
---- over DDS, so `setup()` records them and `u` applies the inverse of the newest
---- record. Every operation it can undo is broadcast, including the copying
+--- over DDS, so `setup()` records them, `u` applies the inverse of the newest
+--- record and `<C-r>` applies it again. Every operation it can undo is broadcast, including the copying
 --- paste, so no key but `D` is ever wrapped.
 ---
 --- The entry is deliberately NOT `--- @sync entry`: it needs `fs.*` and
@@ -103,17 +103,22 @@ M.ancestors = ancestors
 local HOME = os.getenv("HOME") or ""
 local STATE = (os.getenv("XDG_STATE_HOME") or HOME .. "/.local/state") .. "/yazi"
 local LOG = STATE .. "/undo.log"
+local REDO = STATE .. "/undo-redo.log"
 local PURGATORY = STATE .. "/undo-purgatory"
 local TRASH = (os.getenv("XDG_DATA_HOME") or HOME .. "/.local/share") .. "/Trash"
 
 -- ---------------------------------------------------------------------------
 -- The journal on disk. `io` is available in both the sync and the async VM, so
 -- the DDS recorders append directly rather than buffering.
+--
+-- Two files, the way an editor does it: LOG holds what `u` can still undo, REDO
+-- holds what `u` has already undone and `<C-r>` can put back. A new operation
+-- clears REDO, because there is no longer a future to return to.
 -- ---------------------------------------------------------------------------
 
-local function read_lines()
+local function read_lines(path)
 	local lines = {}
-	local f = io.open(LOG, "r")
+	local f = io.open(path, "r")
 	if not f then
 		return lines
 	end
@@ -126,8 +131,8 @@ local function read_lines()
 	return lines
 end
 
-local function write_lines(lines)
-	local f = io.open(LOG, "w")
+local function write_lines(path, lines)
+	local f = io.open(path, "w")
 	if not f then
 		return false
 	end
@@ -139,14 +144,20 @@ local function write_lines(lines)
 	return true
 end
 
-local function append(action, paths)
-	local f = io.open(LOG, "a")
+local function push(path, line)
+	local f = io.open(path, "a")
 	if not f then
 		return false
 	end
-	f:write(encode(action, paths, os.time()), "\n")
+	f:write(line, "\n")
 	f:close()
 	return true
+end
+
+-- what the DDS recorders call: a real operation, so the redo side is dropped
+local function append(action, paths)
+	write_lines(REDO, {})
+	return push(LOG, encode(action, paths, os.time()))
 end
 
 -- ---------------------------------------------------------------------------
@@ -432,21 +443,31 @@ local function undo_delete(rec)
 	return true, string.format("%s restored to %s", n == 1 and "1 file" or n .. " files", tilde(dirname(rec.paths[1])))
 end
 
--- cut, rename, bulk and purge all invert the same way: move `to` back to `from`
-local function undo_move(rec)
-	local pairs_ = twos(rec)
+-- cut, rename, bulk and purge are all a pair of paths, so undoing and redoing
+-- them is the same walk in opposite directions
+local function move_pairs(pairs_, forward)
+	local src, dst = forward and "from" or "to", forward and "to" or "from"
 	for _, p in ipairs(pairs_) do
-		if free(p.to) then
-			return false, "gone: " .. tilde(p.to)
-		elseif not free(p.from) then
-			return false, "occupied: " .. tilde(p.from)
+		if free(p[src]) then
+			return false, "gone: " .. tilde(p[src])
+		elseif not free(p[dst]) then
+			return false, "occupied: " .. tilde(p[dst])
 		end
 	end
 	for _, p in ipairs(pairs_) do
-		fs.create("dir_all", Url(dirname(p.from)))
-		if not move(p.to, p.from) then
-			return false, "could not move it back to " .. tilde(p.from)
+		fs.create("dir_all", Url(dirname(p[dst])))
+		if not move(p[src], p[dst]) then
+			return false, "could not move it to " .. tilde(p[dst])
 		end
+	end
+	return true
+end
+
+local function undo_move(rec)
+	local pairs_ = twos(rec)
+	local ok, err = move_pairs(pairs_, false)
+	if not ok then
+		return false, err
 	end
 	if #pairs_ == 1 then
 		return true, "moved back to " .. tilde(pairs_[1].from)
@@ -507,6 +528,51 @@ local INVERT = {
 	copy = undo_copy,
 }
 
+-- Redoing is the record read the other way round. Nothing here asks, because
+-- none of it destroys anything the trash does not already hold.
+
+local function redo_delete(rec)
+	local n, err = trash_put(rec.paths)
+	if not n then
+		return false, err
+	end
+	return true, string.format("%s back in the trash", n == 1 and "1 file" or n .. " files")
+end
+
+local function redo_move(rec)
+	local pairs_ = twos(rec)
+	local ok, err = move_pairs(pairs_, true)
+	if not ok then
+		return false, err
+	end
+	if #pairs_ == 1 then
+		return true, "moved again to " .. tilde(pairs_[1].to)
+	end
+	return true, string.format("%d items moved again to %s", #pairs_, tilde(dirname(pairs_[1].to)))
+end
+
+-- undoing a copy trashed the copies, so redoing it pulls them back out
+local function redo_copy(rec)
+	local targets = {}
+	for _, p in ipairs(twos(rec)) do
+		targets[#targets + 1] = p.to
+	end
+	local n, err = trash_restore(targets)
+	if not n then
+		return false, err
+	end
+	return true, string.format("%d copies restored", n)
+end
+
+local REPLAY = {
+	delete = redo_delete,
+	cut = redo_move,
+	rename = redo_move,
+	bulk = redo_move,
+	purge = redo_move,
+	copy = redo_copy,
+}
+
 -- ---------------------------------------------------------------------------
 -- Commands
 -- ---------------------------------------------------------------------------
@@ -530,19 +596,24 @@ local function restore_hovered(urls)
 	ya.emit("refresh", {})
 end
 
-function M.undo()
-	local lines = read_lines()
-	local rec
+-- pop the newest record a table knows how to apply, dropping unreadable lines
+local function newest(path, known)
+	local lines = read_lines(path)
 	while #lines > 0 do
-		rec = decode(lines[#lines])
-		if rec and INVERT[rec.action] then
-			break
+		local line = lines[#lines]
+		local rec = decode(line)
+		if rec and known[rec.action] then
+			return rec, line, lines
 		end
 		table.remove(lines) -- a line we cannot read is not worth keeping
-		rec = nil
 	end
+	return nil, nil, lines
+end
+
+function M.undo()
+	local rec, line, lines = newest(LOG, INVERT)
 	if not rec then
-		write_lines(lines)
+		write_lines(LOG, lines)
 		return notify("undo [action: none]", "Nothing to undo", "warn")
 	end
 
@@ -554,8 +625,28 @@ function M.undo()
 	end
 
 	table.remove(lines)
-	write_lines(lines)
+	write_lines(LOG, lines)
+	push(REDO, line)
 	done(rec.action, msg)
+	ya.emit("refresh", {})
+end
+
+function M.redo()
+	local rec, line, lines = newest(REDO, REPLAY)
+	if not rec then
+		write_lines(REDO, lines)
+		return notify("redo [action: none]", "Nothing to redo", "warn")
+	end
+
+	local ok, msg = REPLAY[rec.action](rec)
+	if not ok then
+		return notify("redo [action: " .. rec.action .. "]", msg, "warn")
+	end
+
+	table.remove(lines)
+	write_lines(REDO, lines)
+	push(LOG, line)
+	notify("redo [action: " .. rec.action .. "]", msg, "info")
 	ya.emit("refresh", {})
 end
 
@@ -607,7 +698,7 @@ function M:setup(opts)
 	opts = opts or {}
 	set_opts(opts)
 	os.execute("mkdir -p '" .. STATE:gsub("'", "'\\''") .. "'")
-	write_lines(read_lines()) -- apply the cap once per start
+	write_lines(LOG, read_lines(LOG)) -- apply the cap once per start
 
 	ps.sub("trash", function(body)
 		local paths = {}
@@ -667,7 +758,9 @@ end
 
 function M:entry(job)
 	local args = job.args or {}
-	if args[1] == "purge" then
+	if args[1] == "redo" then
+		return M.redo()
+	elseif args[1] == "purge" then
 		return M.purge(args)
 	elseif args[1] == "clean-trash" then
 		return M.clean_trash()
